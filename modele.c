@@ -2,8 +2,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "def_mode_gpio.h"
-#include "ADXL345.h"
+
 
 
 #define I2C_PORT            GPIOB
@@ -64,7 +63,7 @@ struct_xyz_t capteurs;
 #define B6_MASK 0x40
 
 
-void init_ZIF16(void)
+/*void init_ZIF16(void)
 {uint8_t boucle;
  uint32_t choix_INOUT;
  uint8_t	choix_etat;	
@@ -83,7 +82,7 @@ for(boucle = 8; boucle<16; boucle++)
 uint16_t lire_etat_ZIF16(void)
 {
 	return ;
-}
+}*/
 
 void  init_I2C_BITBANGING(void){
     // 1. Ativar o clock para a porta GPIO escolhida
@@ -173,51 +172,51 @@ void config_regADXL(unsigned char reg, unsigned char data)
      
      
      
-void init_adxl_345(void){
+/*void init_adxl_345(void){
     CS_ADXL(RELEASE); 
-    //initialiser power : sequence en plusieurs �tapes conseill�e ?????? supprim� �tape autosleep...
+    //initialiser power : sequence en plusieurs ?tapes conseill?e ?????? supprim? ?tape autosleep...
     config_regADXL(ADXL345_POWER_CTL, 0);// Wakeup  
-   // config_regADXL(ADXL345_POWER_CTL, 16);// Auto_Sleep sera �cras� par mode Measure
+   // config_regADXL(ADXL345_POWER_CTL, 16);// Auto_Sleep sera ?cras? par mode Measure
     config_regADXL(ADXL345_POWER_CTL, 8);// Measure
  //*******************************************DATA FORMAT ******************************************************************   
-    // FORMAT DES DONNES  :  passer en 16G justifi� droit 
-    // B7 : self test : garder � 0
+    // FORMAT DES DONNES  :  passer en 16G justifi? droit 
+    // B7 : self test : garder ? 0
     // B6 : mode SPI 3 ou SPI 4 fils : mettre 0 pour selectionner le mode 4 FILS
     // B5 : niveau logique des ITs   : mettre 1 = /int         mettre 0   =  int (actif haut) : mettre 1
-    // B4 : laisser � 0
+    // B4 : laisser ? 0
     // B3 : Full_ RES : mettre 1 pour disposer de plus de bits possibles
     // B2 : JUSTIFICATION DES DATAs  :  1 left justify, 0 right justify avec extension de signe : mettre 0 
-    // B1 B0 : sensibilit� : mettre 00 pour 2G , 01 pour 4G, 10 pour 8G, 11 pour 16G :   11
+    // B1 B0 : sensibilit? : mettre 00 pour 2G , 01 pour 4G, 10 pour 8G, 11 pour 16G :   11
     // choix  0b00101011 soit 0x2B   
     config_regADXL(ADXL345_DATA_FORMAT, 0x2B);
  
- //***************************************inactivit�/ choc niveau 1****************************************************************
-    //D7 : activit� DC ou AC   (absolu ou relatif aux pr�c�dentes mesures) :mettre 1 pour choisir AC
-    //D6 : activit� sur X
-    //D5 : activit� sur Y 
-    //D4 : activit� sur Z  
-    //D3 : inactivit� DC ou AC   (absolu ou relatif aux pr�c�dentes mesures) :mettre 1 pour choisir AC
-    //D2 : inactivit� sur X
-    //D1 : inactivit� sur Y 
-    //D0 : inactivit� sur Z  
-    // on va dire qu'il y a activit� si on d�tecte une activit� sur X Y ou Z
-    // on va dire qu'il y a inactivit� si on ne d�tecte rien ni sur X ni sur Y ni sur Z en mode AC
+ //***************************************inactivit?/ choc niveau 1****************************************************************
+    //D7 : activit? DC ou AC   (absolu ou relatif aux pr?c?dentes mesures) :mettre 1 pour choisir AC
+    //D6 : activit? sur X
+    //D5 : activit? sur Y 
+    //D4 : activit? sur Z  
+    //D3 : inactivit? DC ou AC   (absolu ou relatif aux pr?c?dentes mesures) :mettre 1 pour choisir AC
+    //D2 : inactivit? sur X
+    //D1 : inactivit? sur Y 
+    //D0 : inactivit? sur Z  
+    // on va dire qu'il y a activit? si on d?tecte une activit? sur X Y ou Z
+    // on va dire qu'il y a inactivit? si on ne d?tecte rien ni sur X ni sur Y ni sur Z en mode AC
     config_regADXL(ADXL345_ACT_INACT_CTL, 0xFF);
     
-    // la valeur est par pas de 62.5mG  ainsi  256 correspondrait � 16G : mettre 
+    // la valeur est par pas de 62.5mG  ainsi  256 correspondrait ? 16G : mettre 
     config_regADXL(ADXL345_THRESH_ACT,16 );
     config_regADXL(ADXL345_THRESH_INACT,8 );
     config_regADXL(ADXL345_TIME_INACT, 1 );//sec 1-255
     
  //*******************************************choc**********************************************************   
-    //D7 � D4 non definis : 0
-    //D3 : suppress double tap si acceleration reste elev�e entre les TAP avec valeur 1
+    //D7 ? D4 non definis : 0
+    //D3 : suppress double tap si acceleration reste elev?e entre les TAP avec valeur 1
     //D2 : tap X enable si 1
     //D1 : tap Y enable si 1
     //D0 : tap Z enable si 1
     
-   config_regADXL(ADXL345_TAP_AXES, 0x0F); // detection choc de tous les cot�s
-   config_regADXL(ADXL345_THRESH_TAP, 0xA0); // detection choc r�gl�e � 10G
+   config_regADXL(ADXL345_TAP_AXES, 0x0F); // detection choc de tous les cot?s
+   config_regADXL(ADXL345_THRESH_TAP, 0xA0); // detection choc r?gl?e ? 10G
    config_regADXL(ADXL345_DUR, 16); // duree minimale du choc 625us increment ici 10ms
    config_regADXL(ADXL345_LATENT, 0x00); // ecart minimum entre tap pas 1.25ms : 0 desactive
    config_regADXL(ADXL345_TAP_AXES, 0x00); // fenetre seconde frappe pas 1.25ms : 0 desactive
@@ -228,7 +227,7 @@ void init_adxl_345(void){
    config_regADXL(ADXL345_TIME_FF, 10); // duree minimale de chute pas 5ms  : 100 ms =20
   
  //***************************************************************************************************************
- //interruptions  activer les ITs : ADXL345_INT_ENABLE  bit � 0 = INT1 , bit � 1 = INT2
+ //interruptions  activer les ITs : ADXL345_INT_ENABLE  bit ? 0 = INT1 , bit ? 1 = INT2
  // selectionner patte INT1 ou INT2: ADXL345_INT_MAP
  // en cas de selection multiple, la lecture de ADXL345_INT_SOURCE
    // pour les deux registres, meme emplacement :
@@ -246,7 +245,7 @@ void init_adxl_345(void){
    
   //***********************************************************************************************************
   //gestion par FIFO pour stocker sans danger  
-   //ADXL345_FIFO_CTL : les 4 bits de poids faible choisissent le d�bit (voir doc))
+   //ADXL345_FIFO_CTL : les 4 bits de poids faible choisissent le d?bit (voir doc))
     //F : 3200Hz, E:1600, D:800, C:400, B:200, A:100, 9:50, 8:25, 7:12.5, 6:6.25, 5:3.125, 
    // ADXL345_FIFO_CTL : 
     // bits B7 B6   : 
@@ -255,22 +254,22 @@ void init_adxl_345(void){
     // 10 STREAM (ecrasement) 
     // 11 Trigger (photo evenement)
     // bit B5  Trigger sur INT1 (0) ou INT2 (1)
-    // bit B4 � B0 : niveau remplissage pour watermark
+    // bit B4 ? B0 : niveau remplissage pour watermark
     
-    config_regADXL(ADXL345_BW_RATE, 0x0A);  // Fonctionnement � 100 HZ
+    config_regADXL(ADXL345_BW_RATE, 0x0A);  // Fonctionnement ? 100 HZ
     config_regADXL(ADXL345_FIFO_CTL, 0x90); // stream, trig int1, avertissement sur mi remplissage (16)
 
-}
+} */
 
 
 
 
-void gere_serial2(void) {
+/*void gere_serial2(void) {
 	uint8_t status = USART2->SR;
 	uint8_t ch_recu = USART2->DR;
 	if(status & ??????) {MaeRcp=0;return;}
     if (ch_recu & B7_MASK) {
-        // === ENT�TE ===
+        // === ENT?TE ===
         entete = ch_recu;
         dataIndex = 0;
 
@@ -282,10 +281,10 @@ void gere_serial2(void) {
             MaeRcp = 5;
         }
     } else {
-        // === DONN�ES ===
+        // === DONN?ES ===
         switch (MaeRcp) {
             case 0:
-                // Attente d'ent�te
+                // Attente d'ent?te
                 break;
 
             // === CASIERS : LEDs vertes/rouges ===
@@ -315,7 +314,7 @@ void gere_serial2(void) {
                 break;
             }
 
-            // === ZIF16 : direction et �tat ===
+            // === ZIF16 : direction et ?tat ===
             case 5: {
                 if (entete & (1 << 0)) ch_recu |= B7_MASK;
                 consigne_dir = (consigne_dir & 0x00FF) | ((uint16_t)ch_recu << 8);
@@ -347,7 +346,7 @@ void gere_serial2(void) {
                 break;
         }
     }
-}
+}*/
 // Função auxiliar, n ssei se vai entrar nao 
 static void SDA_set_output(void) {
     GPIO_InitTypeDef GPIO_InitStruct;
@@ -493,11 +492,11 @@ void lire_etat_casiers(void){
 
 void init_proc(void)
 {
- init_ZIF16();
+ //init_ZIF16();
  init_I2C_BITBANGING();
  init_serial2();
  init_SPI1_ADXL();
- init_adxl_345();// fonction donn�e � condition d'�crire 	config_regADXL(unsigned char reg, unsigned char data)  
+ //init_adxl_345();// fonction donn?e ? condition d'?crire 	config_regADXL(unsigned char reg, unsigned char data)  
 }
 
 void long_delay(void) {
@@ -525,7 +524,7 @@ int main(void)
             long_delay();	
 		/*if (flagMajCasiers) {flagMajCasiers = false;
 				// Appliquer consigne_leds_vertes et consigne_leds_rouges
-				//en envoyant les bonnes trames I2C, chaque PCF sera configur� avec une adresse diff�rente
+				//en envoyant les bonnes trames I2C, chaque PCF sera configur? avec une adresse diff?rente
 			                  maj_leds_casiers(); // par ecriture i2C
 			                  lire_etat_casiers(); // par lecture i2c
 			                  envoyer_trame_casiers();
@@ -533,15 +532,15 @@ int main(void)
 
 		if (flagMajZIF16) {flagMajZIF16 = false;
 				// Appliquer consigne_dir et consigne_etat
-			                 init_ZIF16();//pour mettre � jour les pattes
+			                 init_ZIF16();//pour mettre ? jour les pattes
 			                 etat_ZIF16 = lire_etat_ZIF16();
 			                 envoyer_trame_ZIF16();
 											}	
 	if(USART2->SR & ?????? )
-	  {// gerer la r�ception  serie
+	  {// gerer la r?ception  serie
 	  } //
 	if(USART2->SR & ?????? )	
-	   { //d�piler la fifo()
+	   { //d?piler la fifo()
 	   }
 	if(INT_ADXL)
 	{read_ADXL_sensors(&capteurs.b[0]);
