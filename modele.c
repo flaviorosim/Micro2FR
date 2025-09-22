@@ -1,10 +1,23 @@
 #include "stm32f10x.h"
 #include <stdint.h>
 #include <stdbool.h>
-
-#include "def_mode_gpio.h"
 #include "ADXL345.h"
 
+// Bits 0-1: Modo Principal
+#define PIN_MODE_INPUT          (1U << 0) // 0b0001
+#define PIN_MODE_OUTPUT_PP      (1U << 1) // 0b0010
+#define PIN_MODE_OUTPUT_OD      (1U << 2) // 0b0100
+// Bits 4-5: Estado Secundário
+#define PIN_STATE_LOW_PD        (1U << 4) // 0b00010000 (Low ou Pull-Down)
+#define PIN_STATE_HIGH_PU       (1U << 5) // 0b00100000 (High ou Pull-Up)
+
+
+// Estes são os defines que você realmente usará ao chamar a função.
+#define MODE_INPUT_PULLDOWN     (PIN_MODE_INPUT | PIN_STATE_LOW_PD)
+#define MODE_INPUT_PULLUP       (PIN_MODE_INPUT | PIN_STATE_HIGH_PU)
+#define MODE_OUTPUT_LOW         (PIN_MODE_OUTPUT_PP | PIN_STATE_LOW_PD)
+#define MODE_OUTPUT_HIGH        (PIN_MODE_OUTPUT_PP | PIN_STATE_HIGH_PU)
+#define MODE_OUTPUT_OD_LOW      (PIN_MODE_OUTPUT_OD | PIN_STATE_LOW_PD)
 
 #define I2C_PORT            GPIOB
 #define I2C_SCL_PIN         GPIO_Pin_6  // PB6
@@ -13,12 +26,12 @@
 
 // Endereços (7 bits) dos 6 componentes PCF8574
 // --- A FAZER: Defina os endereços corretos de acordo com a pinagem A0-A2 da sua placa ---
-#define ADDR_LEDS_V_HI      0x41  // PCF para Leds Verdes 15-8 (Byte alto)
-#define ADDR_LEDS_V_LO      0x43  // PCF para Leds Verdes 7-0 (Byte baixo)
-#define ADDR_LEDS_R_HI      0x45  // PCF para Leds Vermelhos 15-8
-#define ADDR_LEDS_R_LO      0x47  // PCF para Leds Vermelhos 7-0
-#define ADDR_SENS_HI        0x49  // PCF para Sensores 15-8
-#define ADDR_SENS_LO        0x4B  // PCF para Sensores 7-0
+#define ADDR_LEDS_V_HI      0x20  // PCF para Leds Verdes 15-8 (Byte alto)
+#define ADDR_LEDS_V_LO      0x21  // PCF para Leds Verdes 7-0 (Byte baixo)
+#define ADDR_LEDS_R_HI      0x23  // PCF para Leds Vermelhos 15-8
+#define ADDR_LEDS_R_LO      0x24  // PCF para Leds Vermelhos 7-0
+#define ADDR_SENS_HI        0x25  // PCF para Sensores 15-8
+#define ADDR_SENS_LO        0x26  // PCF para Sensores 7-0
 
 // Macros para facilitar a manipulação dos pinos
 #define SCL_H()             GPIO_SetBits(I2C_PORT, I2C_SCL_PIN)
@@ -26,6 +39,27 @@
 #define SDA_H()             GPIO_SetBits(I2C_PORT, I2C_SDA_PIN)
 #define SDA_L()             GPIO_ResetBits(I2C_PORT, I2C_SDA_PIN)
 #define SDA_READ()          GPIO_ReadInputDataBit(I2C_PORT, I2C_SDA_PIN)
+
+#define ZIF_PORT_LO         GPIOC // Pinos 1-8 do ZIF (PC0-PC7)
+#define ZIF_PORT_HI         GPIOB // Pinos 9-16 do ZIF (PB8-PB15)
+#define ZIF_RCC_PORT_LO     RCC_APB2Periph_GPIOC
+#define ZIF_RCC_PORT_HI     RCC_APB2Periph_GPIOB
+
+// --- Pinos SPI e Controle ADXL345  ---
+#define ADXL_SPI            SPI1
+#define ADXL_SPI_RCC        RCC_APB2Periph_SPI1
+#define ADXL_GPIO_RCC       RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOC // Habilita GPIOA e GPIOC
+
+#define ADXL_SCK_PORT       GPIOA
+#define ADXL_SCK_PIN        GPIO_Pin_5
+#define ADXL_MISO_PORT      GPIOA
+#define ADXL_MISO_PIN       GPIO_Pin_6
+#define ADXL_MOSI_PORT      GPIOA
+#define ADXL_MOSI_PIN       GPIO_Pin_7
+#define ADXL_CS_PORT        GPIOA
+#define ADXL_CS_PIN         GPIO_Pin_4
+#define ADXL_INT_PORT       GPIOC
+#define ADXL_INT_PIN        GPIO_Pin_4
 
 // === Variables globales ===
 uint8_t MaeRcp = 0;
@@ -40,12 +74,20 @@ uint16_t consigne_leds_rouges = 0;
 uint16_t consigne_dir = 0;
 uint16_t consigne_etat = 0;
 uint16_t etat_casiers =0;
+uint16_t etat_ZIF16 = 0;
 
+uint8_t fifo_tx[32];
+uint8_t pw_tx = 0;
+uint8_t pr_tx = 0;
+volatile int place_libre_tx = 32;
 
-uint8_t fifo[256];
-uint8_t pw =0;
-uint8_t pr =0;
-int place_libre = 256;
+bool fifo_push(uint8_t byte);
+bool fifo_pop(uint8_t* p_byte);
+
+// --- Funções de Envio de Trames ---
+void envoyer_trame_casiers(void);
+void envoyer_trame_ZIF16(void);
+void envoyer_trame_accelero(void);
 
 typedef union access_sensor {//16 bit
 
@@ -63,26 +105,93 @@ struct_xyz_t capteurs;
 #define B7_MASK 0x80
 #define B6_MASK 0x40
 
+void Configure_Pin_Generic(GPIO_TypeDef* GPIOx, uint16_t GPIO_Pin, uint8_t mode) {
+    GPIO_InitTypeDef GPIO_InitStruct;
+    GPIO_InitStruct.GPIO_Pin = GPIO_Pin;
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
 
+    // Decodifica o modo principal
+    if (mode & PIN_MODE_INPUT) {
+        if (mode & PIN_STATE_HIGH_PU) GPIO_InitStruct.GPIO_Mode = GPIO_Mode_IPU; // Input Pull-Up
+        else GPIO_InitStruct.GPIO_Mode = GPIO_Mode_IPD; // Input Pull-Down
+    }
+    else if (mode & PIN_MODE_OUTPUT_PP) {
+        GPIO_InitStruct.GPIO_Mode = GPIO_Mode_Out_PP;
+    }
+    else if (mode & PIN_MODE_OUTPUT_OD) {
+        GPIO_InitStruct.GPIO_Mode = GPIO_Mode_Out_OD;
+    }
+
+    GPIO_Init(GPIOx, &GPIO_InitStruct);
+
+    // Define o nível de saída APÓS a inicialização do modo
+    if ((mode & PIN_MODE_OUTPUT_PP) || (mode & PIN_MODE_OUTPUT_OD)) {
+        if (mode & PIN_STATE_HIGH_PU) GPIO_SetBits(GPIOx, GPIO_Pin);   // Nível Alto
+        else GPIO_ResetBits(GPIOx, GPIO_Pin); // Nível Baixo
+    }
+}
+		
 void init_ZIF16(void)
-{uint8_t boucle;
- uint32_t choix_INOUT;
- uint8_t	choix_etat;	
-for(boucle = 0; boucle<8; boucle++)
-	{ choix_INOUT = 	;
-		choix_etat = 		 ;
-	  
-	}
-for(boucle = 8; boucle<16; boucle++)
-	{ choix_INOUT =  ;
-	  choix_etat =   ;
-	 
-	}
+{		uint8_t boucle;
+    uint8_t dir_bit;        // Armazena o bit de direção (1=Input, 0=Output) para o pino atual
+    uint8_t etat_bit;       // Armazena o bit de estado (1=High/PullUp, 0=Low/PullDown)
+    uint8_t mode_final;     // Armazena o modo combinado para a função genérica
+    
+    // Habilita o clock para as duas portas GPIO que controlam o ZIF16
+    RCC_APB2PeriphClockCmd(ZIF_RCC_PORT_LO | ZIF_RCC_PORT_HI, ENABLE);
+
+    // Primeiro loop: para os pinos 1 a 8 do ZIF, que estão em GPIOC (PC0 a PC7)
+    for(boucle = 0; boucle < 8; boucle++)
+    {
+        // 1. Extrai o bit de configuração para o pino 'boucle'
+        dir_bit  = (consigne_dir >> boucle) & 1;
+        etat_bit = (consigne_etat >> boucle) & 1;
+        
+        // 2. Combina os dois bits para formar o parâmetro 'mode'
+        //    (conforme a lógica do def_mode_gpio.h)
+        if (dir_bit == 1 && etat_bit == 1)      mode_final = MODE_INPUT_PULLUP;
+        else if (dir_bit == 1 && etat_bit == 0) mode_final = MODE_INPUT_PULLDOWN;
+        else if (dir_bit == 0 && etat_bit == 1) mode_final = MODE_OUTPUT_HIGH;
+        else /* dir=0, etat=0 */                mode_final = MODE_OUTPUT_LOW;
+
+        // 3. Chama a função genérica para configurar o pino PC[boucle]
+        Configure_Pin_Generic(ZIF_PORT_LO, (1 << boucle), mode_final);
+    }
+    
+    // Segundo loop: para os pinos 9 a 16 do ZIF, que estão em GPIOB (PB8 a PB15)
+    for(boucle = 8; boucle < 16; boucle++)
+    {
+        // 1. Extrai o bit de configuração para o pino 'boucle'
+        dir_bit  = (consigne_dir >> boucle) & 1;
+        etat_bit = (consigne_etat >> boucle) & 1;
+
+        // 2. Combina os dois bits para formar o parâmetro 'mode'
+        if (dir_bit == 1 && etat_bit == 1)      mode_final = MODE_INPUT_PULLUP;
+        else if (dir_bit == 1 && etat_bit == 0) mode_final = MODE_INPUT_PULLDOWN;
+        else if (dir_bit == 0 && etat_bit == 1) mode_final = MODE_OUTPUT_HIGH;
+        else /* dir=0, etat=0 */                mode_final = MODE_OUTPUT_LOW;
+
+        // 3. Chama a função genérica para configurar o pino PB[boucle]
+        //    Note que o pino 9 corresponde ao bit 8 (1<<8), o pino 10 ao bit 9 (1<<9), etc.
+        Configure_Pin_Generic(ZIF_PORT_HI, (1 << boucle), mode_final);
+    }
 }
 
 uint16_t lire_etat_ZIF16(void)
 {
-	return ;
+    uint16_t etat_actuel = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i < 8) {
+            if (GPIO_ReadInputDataBit(ZIF_PORT_LO, (1 << i))) {
+                etat_actuel |= (1 << i);
+            }
+        } else {
+            if (GPIO_ReadInputDataBit(ZIF_PORT_HI, (1 << i))) {
+                etat_actuel |= (1 << i);
+            }
+        }
+    }
+    return etat_actuel;
 }
 
 void  init_I2C_BITBANGING(void){
@@ -148,129 +257,209 @@ void init_serial2(void)
     USART_Cmd(USART2, ENABLE);
 }
 
+uint8_t SPI_transceiver(uint8_t data) {
+    // Espera o buffer de transmissão ficar vazio
+    while (SPI_I2S_GetFlagStatus(ADXL_SPI, SPI_I2S_FLAG_TXE) == RESET);
+    // Envia o byte
+    SPI_I2S_SendData(ADXL_SPI, data);
+    // Espera o buffer de recepção conter um dado
+    while (SPI_I2S_GetFlagStatus(ADXL_SPI, SPI_I2S_FLAG_RXNE) == RESET);
+    // Retorna o byte recebido
+    return SPI_I2S_ReceiveData(ADXL_SPI);
+}
+
+
+void config_regADXL(uint8_t reg, uint8_t data) {
+    CS_ADXL_SELECT();       // Baixa o Chip Select para iniciar a comunicação
+    SPI_transceiver(reg);   // Envia o endereço do registrador (bit R/W=0 implícito)
+    SPI_transceiver(data);  // Envia o dado a ser escrito
+    CS_ADXL_DESELECT();     // Levanta o Chip Select para terminar
+}
+
+
+uint8_t lire_regADXL(uint8_t reg) {
+    uint8_t data;
+    CS_ADXL_SELECT();
+    // Para ler, o bit 7 (R/W) do primeiro byte deve ser 1
+    SPI_transceiver(reg | 0x80);
+    // Envia um byte "dummy" (0x00) para gerar o clock e receber o dado
+    data = SPI_transceiver(0x00);
+    CS_ADXL_DESELECT();
+    return data;
+}
+
+void lire_multiple_regADXL(uint8_t start_reg, uint8_t count, uint8_t* p_buffer) {
+    CS_ADXL_SELECT();
+    // Para ler múltiplos bytes, os bits 7 (R/W) e 6 (MB) devem ser 1
+    SPI_transceiver(start_reg | 0x80 | 0x40);
+    for (uint8_t i = 0; i < count; i++) {
+        p_buffer[i] = SPI_transceiver(0x00);
+    }
+    CS_ADXL_DESELECT();
+}
+
+void envoyer_trame_accelero(void) {
+    if (place_libre_tx < 7) return; // Precisa de 7 bytes livres
+
+    uint8_t ent = 0xF0;
+    // Dados em 13 bits, enviados em 2 bytes com b7=0
+    // capteurs.b[0] = X_LSB, capteurs.b[1] = X_MSB, etc.
+    uint8_t x_msb = capteurs.b[1] & 0x3F; // Pega 6 bits
+    uint8_t x_lsb = capteurs.b[0];       // Pega 7 bits (b7 já é 0)
+    uint8_t y_msb = capteurs.b[3] & 0x3F;
+    uint8_t y_lsb = capteurs.b[2];
+    uint8_t z_msb = capteurs.b[5] & 0x3F;
+    uint8_t z_lsb = capteurs.b[4];
+
+    fifo_push(ent);
+    fifo_push(x_msb);
+    fifo_push(x_lsb);
+    fifo_push(y_msb);
+    fifo_push(y_lsb);
+    fifo_push(z_msb);
+    fifo_push(z_lsb);
+}
+
+
 void init_SPI1_ADXL(void)
 {
     // 1. Activer les horloges pour GPIOA et SPI1
- 
+    RCC_APB2PeriphClockCmd(ADXL_SPI_RCC | ADXL_GPIO_RCC, ENABLE);
 
-    // 2. Configurer les broches SPI
-    // PA5 - SCK : 
-    // PA6 - MISO : 
-    // PA7 - MOSI : 
-    // PA4 - nSS : GPIO Output Push-Pull (manuelle)
-   
+    GPIO_InitTypeDef GPIO_InitStruct;
+    // 2. Configurar pinos SPI (SCK, MISO, MOSI) como Alternate Function
+    GPIO_InitStruct.GPIO_Pin = ADXL_SCK_PIN | ADXL_MOSI_PIN;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(ADXL_SCK_PORT, &GPIO_InitStruct);
 
-    // 3. Configurer SPI1
- 
+    GPIO_InitStruct.GPIO_Pin = ADXL_MISO_PIN;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_IPU; // MISO como entrada com pull-up
+    GPIO_Init(ADXL_MISO_PORT, &GPIO_InitStruct);
+    
+    // 3. Configurar pino CS como GPIO Saída
+    Configure_Pin_Generic(ADXL_CS_PORT, ADXL_CS_PIN, MODE_OUTPUT_HIGH);
+    
+    // 4. Configurar pino INT como GPIO Entrada
+    Configure_Pin_Generic(ADXL_INT_PORT, ADXL_INT_PIN, MODE_INPUT_PULLUP);
+
+    // 5. Configurar o periférico SPI1
+    SPI_InitTypeDef SPI_InitStruct;
+    SPI_InitStruct.SPI_Direction = SPI_Direction_2Lines_FullDuplex;
+    SPI_InitStruct.SPI_Mode = SPI_Mode_Master;
+    SPI_InitStruct.SPI_DataSize = SPI_DataSize_8b;
+    SPI_InitStruct.SPI_CPOL = SPI_CPOL_High; // CPOL = 1
+    SPI_InitStruct.SPI_CPHA = SPI_CPHA_2Edge; // CPHA = 1 -> Modo 3
+    SPI_InitStruct.SPI_NSS = SPI_NSS_Soft;    // Controle manual do CS
+    SPI_InitStruct.SPI_BaudRatePrescaler = SPI_BaudRatePrescaler_16; // 72MHz / 16 = 4.5MHz
+    SPI_InitStruct.SPI_FirstBit = SPI_FirstBit_MSB;
+    SPI_InitStruct.SPI_CRCPolynomial = 7;
+    SPI_Init(ADXL_SPI, &SPI_InitStruct);
+
+    // 6. Ativar o SPI1
+    SPI_Cmd(ADXL_SPI, ENABLE);
 }
 
-
-void config_regADXL(unsigned char reg, unsigned char data) 
- { 
- 
-
-	 }   
-     
+  
      
      
 void init_adxl_345(void){
-    CS_ADXL(RELEASE); 
-    //initialiser power : sequence en plusieurs �tapes conseill�e ?????? supprim� �tape autosleep...
-    config_regADXL(ADXL345_POWER_CTL, 0);// Wakeup  
-   // config_regADXL(ADXL345_POWER_CTL, 16);// Auto_Sleep sera �cras� par mode Measure
-    config_regADXL(ADXL345_POWER_CTL, 8);// Measure
- //*******************************************DATA FORMAT ******************************************************************   
-    // FORMAT DES DONNES  :  passer en 16G justifi� droit 
-    // B7 : self test : garder � 0
-    // B6 : mode SPI 3 ou SPI 4 fils : mettre 0 pour selectionner le mode 4 FILS
-    // B5 : niveau logique des ITs   : mettre 1 = /int         mettre 0   =  int (actif haut) : mettre 1
-    // B4 : laisser � 0
-    // B3 : Full_ RES : mettre 1 pour disposer de plus de bits possibles
-    // B2 : JUSTIFICATION DES DATAs  :  1 left justify, 0 right justify avec extension de signe : mettre 0 
-    // B1 B0 : sensibilit� : mettre 00 pour 2G , 01 pour 4G, 10 pour 8G, 11 pour 16G :   11
-    // choix  0b00101011 soit 0x2B   
-    config_regADXL(ADXL345_DATA_FORMAT, 0x2B);
- 
- //***************************************inactivit�/ choc niveau 1****************************************************************
-    //D7 : activit� DC ou AC   (absolu ou relatif aux pr�c�dentes mesures) :mettre 1 pour choisir AC
-    //D6 : activit� sur X
-    //D5 : activit� sur Y 
-    //D4 : activit� sur Z  
-    //D3 : inactivit� DC ou AC   (absolu ou relatif aux pr�c�dentes mesures) :mettre 1 pour choisir AC
-    //D2 : inactivit� sur X
-    //D1 : inactivit� sur Y 
-    //D0 : inactivit� sur Z  
-    // on va dire qu'il y a activit� si on d�tecte une activit� sur X Y ou Z
-    // on va dire qu'il y a inactivit� si on ne d�tecte rien ni sur X ni sur Y ni sur Z en mode AC
-    config_regADXL(ADXL345_ACT_INACT_CTL, 0xFF);
+    // Garante que o Chip Select comece em nível alto (não selecionado)
+    CS_ADXL_DESELECT();
     
-    // la valeur est par pas de 62.5mG  ainsi  256 correspondrait � 16G : mettre 
-    config_regADXL(ADXL345_THRESH_ACT,16 );
-    config_regADXL(ADXL345_THRESH_INACT,8 );
-    config_regADXL(ADXL345_TIME_INACT, 1 );//sec 1-255
-    
- //*******************************************choc**********************************************************   
-    //D7 � D4 non definis : 0
-    //D3 : suppress double tap si acceleration reste elev�e entre les TAP avec valeur 1
-    //D2 : tap X enable si 1
-    //D1 : tap Y enable si 1
-    //D0 : tap Z enable si 1
-    
-   config_regADXL(ADXL345_TAP_AXES, 0x0F); // detection choc de tous les cot�s
-   config_regADXL(ADXL345_THRESH_TAP, 0xA0); // detection choc r�gl�e � 10G
-   config_regADXL(ADXL345_DUR, 16); // duree minimale du choc 625us increment ici 10ms
-   config_regADXL(ADXL345_LATENT, 0x00); // ecart minimum entre tap pas 1.25ms : 0 desactive
-   config_regADXL(ADXL345_TAP_AXES, 0x00); // fenetre seconde frappe pas 1.25ms : 0 desactive
- 
- //*****************************************************************************************************************
-   
-   config_regADXL(ADXL345_THRESH_FF, 0x09); // seuil detection FREE FALL  pas 62.5mG 0.6G
-   config_regADXL(ADXL345_TIME_FF, 10); // duree minimale de chute pas 5ms  : 100 ms =20
-  
- //***************************************************************************************************************
- //interruptions  activer les ITs : ADXL345_INT_ENABLE  bit � 0 = INT1 , bit � 1 = INT2
- // selectionner patte INT1 ou INT2: ADXL345_INT_MAP
- // en cas de selection multiple, la lecture de ADXL345_INT_SOURCE
-   // pour les deux registres, meme emplacement :
-   // B7 = DATA_READY
-   // B6 = SINGLE_TAP
-   // B5 = DOUBLE_TAP
-   // B4 = ACTIVITY
-   // B3 = INACTIVITY
-   // B2 = FREE_FALL
-   // B1 = WATER_MARK  (niveau remplissage FIFO)
-   // B0 = OVERRUN     (pas lu assez frequemment)
-    config_regADXL(ADXL345_INT_ENABLE, 0x00);
-    config_regADXL(ADXL345_INT_MAP, 0x7F); //0x7F; 0x00 tout le monde en INT 2 sauf DATA_READY
-    config_regADXL(ADXL345_INT_ENABLE, 0xDF); //0xDF  11011111
-   
-  //***********************************************************************************************************
-  //gestion par FIFO pour stocker sans danger  
-   //ADXL345_FIFO_CTL : les 4 bits de poids faible choisissent le d�bit (voir doc))
-    //F : 3200Hz, E:1600, D:800, C:400, B:200, A:100, 9:50, 8:25, 7:12.5, 6:6.25, 5:3.125, 
-   // ADXL345_FIFO_CTL : 
-    // bits B7 B6   : 
-    // 00 bypass (no fifo)
-    // 01 FIFO (blocage plein) 
-    // 10 STREAM (ecrasement) 
-    // 11 Trigger (photo evenement)
-    // bit B5  Trigger sur INT1 (0) ou INT2 (1)
-    // bit B4 � B0 : niveau remplissage pour watermark
-    
-    config_regADXL(ADXL345_BW_RATE, 0x0A);  // Fonctionnement � 100 HZ
-    config_regADXL(ADXL345_FIFO_CTL, 0x90); // stream, trig int1, avertissement sur mi remplissage (16)
+    // --- Configuração de Energia (POWER_CTL, reg 0x2D) ---
+    // Sequência recomendada: Standby -> Measure
+    config_regADXL(ADXL345_POWER_CTL, 0x00); // Coloca em modo Standby para alterar configurações
+    config_regADXL(ADXL345_POWER_CTL, 0x08); // Ativa o modo de Medição
 
+    // --- Formato dos Dados (DATA_FORMAT, reg 0x31) ---
+    // Conforme os comentários: SPI 4-fios, INT ativo alto, Full Res, justificado à direita, range de 16G.
+    // O valor 0x0B (0b00001011) configura Full Res (B3=1) e 16g (B1B0=11).
+    // Para INT ativo alto (B5=0) e SPI 4-fios (B6=0), o valor 0x0B está correto.
+    config_regADXL(ADXL345_DATA_FORMAT, 0x0B);
+
+    // --- Taxa de Dados e Energia (BW_RATE, reg 0x2C) ---
+    // O comentário no final da função indica 100 Hz.
+    // 100 Hz corresponde ao valor 0x0A.
+    config_regADXL(ADXL345_BW_RATE, 0x0A);
+    
+    // --- Controle de Atividade/Inatividade (ACT_INACT_CTL, etc.) ---
+    // Ativa a detecção de atividade e inatividade em todos os eixos (X, Y, Z) em modo AC (relativo).
+    config_regADXL(ADXL345_ACT_INACT_CTL, 0xFF);
+    config_regADXL(ADXL345_THRESH_ACT, 16);    // Limiar de atividade: 16 * 62.5mg = 1g
+    config_regADXL(ADXL345_THRESH_INACT, 8);   // Limiar de inatividade: 8 * 62.5mg = 0.5g
+    config_regADXL(ADXL345_TIME_INACT, 2);     // Tempo em inatividade para gerar interrupção (2 segundos)
+    
+    // --- Detecção de Choc (TAP) ---
+    // Os comentários indicam duas escritas conflitantes em TAP_AXES. Vamos usar a primeira.
+    config_regADXL(ADXL345_DUR, 16);           // Duração mínima do choque para ser detectado (~10ms)
+    config_regADXL(ADXL345_THRESH_TAP, 160);   // Limiar do choque: 160 * 62.5mg = 10g. 0xA0 = 160.
+    config_regADXL(ADXL345_TAP_AXES, 0x07);    // Ativa a detecção de TAP nos eixos X, Y e Z.
+    
+    // --- Mapeamento e Ativação das Interrupções ---
+    // Objetivo: Mapear todas as interrupções para o pino INT1, exceto DATA_READY.
+    // No seu código original, INT_MAP estava 0x7F, que mapeia DATA_READY para INT2 e o resto para INT1.
+    // INT_ENABLE estava 0xDF, que habilita todas as interrupções, exceto DOUBLE_TAP.
+    // Esta configuração parece complexa e talvez conflitante. Uma configuração mais simples seria:
+    config_regADXL(ADXL345_INT_MAP, 0x00);      // Mapeia TODAS as interrupções para o pino INT1
+    config_regADXL(ADXL345_INT_ENABLE, 0x98);   // Habilita APENAS Data Ready(B7), Activity(B4) e Inactivity(B3)
+
+    // --- Controle da FIFO ---
+    // Modo Stream: a FIFO armazena as 32 amostras mais recentes, descartando as antigas.
+    config_regADXL(ADXL345_FIFO_CTL, 0x80); // 0b10000000 -> Modo Stream
+} 
+
+bool fifo_push(uint8_t byte) {
+    if (place_libre_tx == 0) return false;
+    fifo_tx[pw_tx] = byte;
+    pw_tx = (pw_tx + 1) % 32;
+    place_libre_tx--;
+    return true;
 }
 
+bool fifo_pop(uint8_t* p_byte) {
+    if (place_libre_tx == 32) return false;
+    *p_byte = fifo_tx[pr_tx];
+    pr_tx = (pr_tx + 1) % 32;
+    place_libre_tx++;
+    return true;
+}
 
+void envoyer_trame_casiers(void) {
+    if (place_libre_tx < 3) return;
+    uint8_t header = 0xC0;
+    uint8_t octet1 = (etat_casiers >> 8) & 0xFF;
+    uint8_t octet2 = etat_casiers & 0xFF;
+    
+    header |= ((octet1 & 0x80) >> 7) << 0; // b7 do byte alto no bit 0
+    header |= ((octet2 & 0x80) >> 7) << 1; // b7 do byte baixo no bit 1
+    
+    fifo_push(header);
+    fifo_push(octet1 & 0x7F);
+    fifo_push(octet2 & 0x7F);
+}
+
+void envoyer_trame_ZIF16(void) {
+    if (place_libre_tx < 3) return;
+    uint8_t header = 0x80;
+    uint8_t octet1 = (etat_ZIF16 >> 8) & 0xFF;
+    uint8_t octet2 = etat_ZIF16 & 0xFF;
+    
+    header |= ((octet1 & 0x80) >> 7) << 0;
+    header |= ((octet2 & 0x80) >> 7) << 1;
+    
+    fifo_push(header);
+    fifo_push(octet1 & 0x7F);
+    fifo_push(octet2 & 0x7F);
+}
 
 
 void gere_serial2(void) {
 	uint8_t status = USART2->SR;
 	uint8_t ch_recu = USART2->DR;
-	if(status & ??????) {MaeRcp=0;return;}
+	if(status & (USART_SR_ORE | USART_SR_NE | USART_SR_FE)) {MaeRcp=0;return;}
     if (ch_recu & B7_MASK) {
-        // === ENT�TE ===
+        // === ENT?TE ===
         entete = ch_recu;
         dataIndex = 0;
 
@@ -282,10 +471,10 @@ void gere_serial2(void) {
             MaeRcp = 5;
         }
     } else {
-        // === DONN�ES ===
+        // === DONN?ES ===
         switch (MaeRcp) {
             case 0:
-                // Attente d'ent�te
+                // Attente d'ent?te
                 break;
 
             // === CASIERS : LEDs vertes/rouges ===
@@ -315,7 +504,7 @@ void gere_serial2(void) {
                 break;
             }
 
-            // === ZIF16 : direction et �tat ===
+            // === ZIF16 : direction et ?tat ===
             case 5: {
                 if (entete & (1 << 0)) ch_recu |= B7_MASK;
                 consigne_dir = (consigne_dir & 0x00FF) | ((uint16_t)ch_recu << 8);
@@ -493,11 +682,14 @@ void lire_etat_casiers(void){
 
 void init_proc(void)
 {
+ consigne_dir = 0xFFFF; // 1 = Input para todos os 16 pinos
+ consigne_etat = 0x0000; // 0 = Pull-down para todos os 16 pinos
+	
  init_ZIF16();
  init_I2C_BITBANGING();
  init_serial2();
  init_SPI1_ADXL();
- init_adxl_345();// fonction donn�e � condition d'�crire 	config_regADXL(unsigned char reg, unsigned char data)  
+ init_adxl_345();
 }
 
 void long_delay(void) {
@@ -509,44 +701,43 @@ int main(void)
 { int rep_ack;
 	uint8_t bits_entete;
 	uint16_t etat_ZIF16;
-	// init_proc();
-	init_I2C_BITBANGING();
+	init_proc();
 	
 	while(1)
 		{
-           // Acende o LED 0 (bit 0 = 1)
-            consigne_leds_vertes = 0x0001;
-            maj_leds_casiers();
-            long_delay();
+        // 1. Processa recepção serial (TP1)
+        if (USART_GetFlagStatus(USART2, USART_FLAG_RXNE) == SET) {
+            gere_serial2();
+        }
 
-            // Apaga todos os LEDs (todos os bits = 0)
-            consigne_leds_vertes = 0x0000;
+        // 2. Executa ações baseadas nos flags (TP1)
+        if (flagMajCasiers) {
+            flagMajCasiers = false;
             maj_leds_casiers();
-            long_delay();	
-		/*if (flagMajCasiers) {flagMajCasiers = false;
-				// Appliquer consigne_leds_vertes et consigne_leds_rouges
-				//en envoyant les bonnes trames I2C, chaque PCF sera configur� avec une adresse diff�rente
-			                  maj_leds_casiers(); // par ecriture i2C
-			                  lire_etat_casiers(); // par lecture i2c
-			                  envoyer_trame_casiers();
-		}
+            lire_etat_casiers();
+            envoyer_trame_casiers();
+        }
+        if (flagMajZIF16) {
+            flagMajZIF16 = false;
+            init_ZIF16();
+            etat_ZIF16 = lire_etat_ZIF16();
+            envoyer_trame_ZIF16();
+        }
 
-		if (flagMajZIF16) {flagMajZIF16 = false;
-				// Appliquer consigne_dir et consigne_etat
-			                 init_ZIF16();//pour mettre � jour les pattes
-			                 etat_ZIF16 = lire_etat_ZIF16();
-			                 envoyer_trame_ZIF16();
-											}	
-	if(USART2->SR & ?????? )
-	  {// gerer la r�ception  serie
-	  } //
-	if(USART2->SR & ?????? )	
-	   { //d�piler la fifo()
-	   }
-	if(INT_ADXL)
-	{read_ADXL_sensors(&capteurs.b[0]);
-	 envoi_trame_accelero();
-    } */
-     																			
+        // 3. Verifica o acelerômetro (TP2)
+        // O roteiro diz "on scruptera la patte", então faremos polling.
+        if (GPIO_ReadInputDataBit(ADXL_INT_PORT, ADXL_INT_PIN) == SET) {
+            // A flag de "Data Ready" está ativa, então lemos os 6 bytes de dados
+            lire_multiple_regADXL(ADXL345_DATAX0, 6, capteurs.b);
+            envoyer_trame_accelero();
+        }
+
+        // 4. Processa transmissão serial (TP1 e TP2)
+        if ((USART_GetFlagStatus(USART2, USART_FLAG_TXE) == SET) && (place_libre_tx < 32)) {
+            uint8_t byte_a_enviar;
+            if (fifo_pop(&byte_a_enviar)) {
+                USART_SendData(USART2, byte_a_enviar);
+            }
+        }																
  } // fin while(1)
 }//fin main
