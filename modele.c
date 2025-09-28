@@ -1,6 +1,7 @@
 #include "stm32f10x.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include "ADXL345.h"
 
 // Bits 0-1: Modo Principal
@@ -76,10 +77,17 @@ uint16_t consigne_etat = 0;
 uint16_t etat_casiers =0;
 uint16_t etat_ZIF16 = 0;
 
-uint8_t fifo_tx[32];
-uint8_t pw_tx = 0;
-uint8_t pr_tx = 0;
-volatile int place_libre_tx = 32;
+
+#define FIFO_TX_SIZE 64 // Um bom tamanho para strings de texto e tramas
+uint8_t fifo_tx[FIFO_TX_SIZE];
+
+uint8_t fifo_tx[64];
+volatile uint8_t pw_tx = 0;
+volatile uint8_t pr_tx = 0;
+volatile int place_libre_tx = 64;
+
+volatile uint32_t ultimo_tempo_adxl = 0;
+volatile uint32_t contador_systick = 0;
 
 bool fifo_push(uint8_t byte);
 bool fifo_pop(uint8_t* p_byte);
@@ -89,21 +97,22 @@ void envoyer_trame_casiers(void);
 void envoyer_trame_ZIF16(void);
 void envoyer_trame_accelero(void);
 
-typedef union access_sensor {//16 bit
-
-        struct {
-            uint16_t x; 
-            uint16_t y; 
-					  uint16_t z; 
-        } c;
-        unsigned char b[6];
-    } struct_xyz_t;
+typedef union access_sensor {
+    struct {
+        int16_t x, y, z;
+    } c;
+    uint8_t b[6];
+} struct_xyz_t;
 
 struct_xyz_t capteurs;
 
 
 #define B7_MASK 0x80
 #define B6_MASK 0x40
+
+void SysTick_Handler(void) {
+    contador_systick++;
+}
 
 void Configure_Pin_Generic(GPIO_TypeDef* GPIOx, uint16_t GPIO_Pin, uint8_t mode) {
     GPIO_InitTypeDef GPIO_InitStruct;
@@ -298,28 +307,28 @@ void lire_multiple_regADXL(uint8_t start_reg, uint8_t count, uint8_t* p_buffer) 
     CS_ADXL_DESELECT();
 }
 
-void envoyer_trame_accelero(void) {
-    if (place_libre_tx < 7) return; // Precisa de 7 bytes livres
 
-    uint8_t ent = 0xF0;
-    // Dados em 13 bits, enviados em 2 bytes com b7=0
-    // capteurs.b[0] = X_LSB, capteurs.b[1] = X_MSB, etc.
-    uint8_t x_msb = capteurs.b[1] & 0x3F; // Pega 6 bits
-    uint8_t x_lsb = capteurs.b[0];       // Pega 7 bits (b7 já é 0)
-    uint8_t y_msb = capteurs.b[3] & 0x3F;
-    uint8_t y_lsb = capteurs.b[2];
-    uint8_t z_msb = capteurs.b[5] & 0x3F;
-    uint8_t z_lsb = capteurs.b[4];
+void envoyer_trame_accelero_legivel(void) {
+    char buffer_texto[40]; // Buffer para criar a string. Ex: "X=-12, Y=5, Z=258\r\n"
+    
+    // Os dados do ADXL345 vêm em 2 bytes por eixo, em formato "complemento de dois".
+    // Precisamos combiná-los em um número de 16 bits com sinal para ter o valor real.
+    int16_t x_val = (int16_t)(capteurs.b[1] << 8 | capteurs.b[0]);
+    int16_t y_val = (int16_t)(capteurs.b[3] << 8 | capteurs.b[2]);
+    int16_t z_val = (int16_t)(capteurs.b[5] << 8 | capteurs.b[4]);
 
-    fifo_push(ent);
-    fifo_push(x_msb);
-    fifo_push(x_lsb);
-    fifo_push(y_msb);
-    fifo_push(y_lsb);
-    fifo_push(z_msb);
-    fifo_push(z_lsb);
+    // Cria a string formatada usando sprintf. \r\n garante a quebra de linha no monitor.
+    sprintf(buffer_texto, "X=%d, Y=%d, Z=%d\r\n", x_val, y_val, z_val);
+    
+    // Coloca a string, caractere por caractere, na FIFO de transmissão
+    for (int i = 0; buffer_texto[i] != '\0'; i++) {
+        if (place_libre_tx > 0) {
+            fifo_push(buffer_texto[i]);
+        } else {
+            break; // Para se a FIFO encher (pouco provável com o delay no main)
+        }
+    }
 }
-
 
 void init_SPI1_ADXL(void)
 {
@@ -410,18 +419,26 @@ void init_adxl_345(void){
 } 
 
 bool fifo_push(uint8_t byte) {
-    if (place_libre_tx == 0) return false;
+    uint8_t next_pw = (pw_tx + 1) % FIFO_TX_SIZE;
+    
+    // Verifica se a FIFO está cheia (o ponteiro de escrita alcançaria o de leitura)
+    if (next_pw == pr_tx) {
+        return false; // Falha, FIFO cheia
+    }
+    
     fifo_tx[pw_tx] = byte;
-    pw_tx = (pw_tx + 1) % 32;
-    place_libre_tx--;
+    pw_tx = next_pw; // Atualiza o ponteiro de escrita
     return true;
 }
 
 bool fifo_pop(uint8_t* p_byte) {
-    if (place_libre_tx == 32) return false;
+    // Verifica se a FIFO está vazia (ponteiros de leitura e escrita são iguais)
+    if (pr_tx == pw_tx) {
+        return false; // Falha, FIFO vazia
+    }
+    
     *p_byte = fifo_tx[pr_tx];
-    pr_tx = (pr_tx + 1) % 32;
-    place_libre_tx++;
+    pr_tx = (pr_tx + 1) % FIFO_TX_SIZE; // Atualiza o ponteiro de leitura
     return true;
 }
 
@@ -690,6 +707,9 @@ void init_proc(void)
  init_serial2();
  init_SPI1_ADXL();
  init_adxl_345();
+	
+ SysTick_Config(72000); 
+
 }
 
 void long_delay(void) {
@@ -703,14 +723,13 @@ int main(void)
 	uint16_t etat_ZIF16;
 	init_proc();
 	
-	while(1)
-		{
-        // 1. Processa recepção serial (TP1)
+    while(1) {
+        // TAREFA 1: Processar recepção serial
         if (USART_GetFlagStatus(USART2, USART_FLAG_RXNE) == SET) {
             gere_serial2();
         }
 
-        // 2. Executa ações baseadas nos flags (TP1)
+        // TAREFA 2: Executar ações do TP1
         if (flagMajCasiers) {
             flagMajCasiers = false;
             maj_leds_casiers();
@@ -724,20 +743,27 @@ int main(void)
             envoyer_trame_ZIF16();
         }
 
-        // 3. Verifica o acelerômetro (TP2)
-        // O roteiro diz "on scruptera la patte", então faremos polling.
-        if (GPIO_ReadInputDataBit(ADXL_INT_PORT, ADXL_INT_PIN) == SET) {
-            // A flag de "Data Ready" está ativa, então lemos os 6 bytes de dados
-            lire_multiple_regADXL(ADXL345_DATAX0, 6, capteurs.b);
-            envoyer_trame_accelero();
-        }
+				// TAREFA 3: Verificar o acelerômetro
+				if (GPIO_ReadInputDataBit(ADXL_INT_PORT, ADXL_INT_PIN) == SET) {
+						if ((contador_systick - ultimo_tempo_adxl) >= 100) {
+								// Limpa interrupção
+								CS_ADXL_SELECT();
+								SPI_transceiver(0x30 | 0x80);
+								SPI_transceiver(0x00);
+								CS_ADXL_DESELECT();
+								
+								lire_multiple_regADXL(ADXL345_DATAX0, 6, capteurs.b);
+								envoyer_trame_accelero_legivel();
+								ultimo_tempo_adxl = contador_systick;
+						}
+				}
 
-        // 4. Processa transmissão serial (TP1 e TP2)
-        if ((USART_GetFlagStatus(USART2, USART_FLAG_TXE) == SET) && (place_libre_tx < 32)) {
+        // TAREFA 4: Processar transmissão serial (com a FIFO corrigida)
+        if (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == SET) {
             uint8_t byte_a_enviar;
             if (fifo_pop(&byte_a_enviar)) {
                 USART_SendData(USART2, byte_a_enviar);
             }
-        }																
- } // fin while(1)
+        }
+    }
 }//fin main
